@@ -5,4 +5,4 @@ Here you can find the notebooks for the different tasks in the Risk Monitoring p
 In A1.6 you can find several notebooks to get the extent of the affected areas for different disaster events, e.g. fire, flooding and landslides. 
 
 
-[Project site:](https://www.eurac.edu/en/projects/riskmonitoring)
+[Project site](https://www.eurac.edu/en/projects/riskmonitoring)
