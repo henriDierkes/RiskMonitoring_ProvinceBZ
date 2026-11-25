@@ -23,22 +23,23 @@ warnings.filterwarnings(
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-YEARS = [2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023 ,2024, 2026]
-THR = 0.4                    # coherence threshold
-VERSION = "v0.4"
-MIN_PATCH_M2 = 10_000        # remove isolated patches smaller than this
-MAX_HOLE_M2 = 10_000         # fill holes smaller than this
+YEARS = [2016, 2017, 2018, 2019, 2020, 2021, 2022,2023,2024, 2025, 2026]
+#
+THR = 0.4                   # coherence threshold
+VERSION = "v0.4_full"
+MIN_PATCH_M2 = 10000        # remove isolated patches smaller than this
+MAX_HOLE_M2 = 1    # fill holes smaller than this
 TAG = f"minPatch{MIN_PATCH_M2}_hole{MAX_HOLE_M2}"   # keeps runs with different settings apart
 
 STEPS = {"composite", "threshold", "align", "clean", "polygons", "areas"}
 
 BASE = Path("/mnt/CEPH_PROJECTS/provinzBZ_risk_EO/GlacierOutlines")
-OUT = BASE / "tests_ratio/"
-S2_BASE = BASE / "tests/S2_indices"
-S1_BASE = BASE / "tests/coherence"
-INVENTORY = BASE / "glacier_outline/glacier_inventory/SGIhom_1997_v2025.shp"
+OUT = BASE / "results_test"
+S2_BASE = BASE / "sentinel_data/S2_indices_test"
+S1_BASE = BASE / "sentinel_data/S1_coherence"
+INVENTORY = BASE / "references/glacier_inventory/SGIhom_1997_v2025.shp"
 
-# One place for all output naming: layer -> folder + filename templates
+# layer -> folder + filename templates
 LAYERS = {
     "s2": dict(
         folder="S2",
@@ -102,17 +103,18 @@ def merged_max(east, west):
 
 def step_composite(year):
     d = S2_BASE / str(year)
+    o = S2_BASE / str(year)
     f = {
-        (reg, idx): find_one(d, f"S2_mosaic_{reg}_*_{idx}_*.tiff")
-        for reg in ("east", "west") for idx in ("ndsi", "ratio")
+        (reg, idx): find_one(d, f"S2_mosaic_{reg}_*_{idx}.tiff")
+        for reg in ("east", "west") for idx in ("ndsi_0.4", "ratio_10")
     }
     if None in f.values():
-        print(f"Skipping composite {year}: expected exactly four input files.")
+        print(f"Skipping composite {year}: expected exactly two input files.")
         return
-    ndsi, tf, crs = merged_max(f["east", "ndsi"], f["west", "ndsi"])
-    ratio, _, _ = merged_max(f["east", "ratio"], f["west", "ratio"])
-    glacier = ((ndsi == 1) | (ratio == 1)).astype("uint8")
-    write_tif(d / f"glacier_composite_{year}.tiff", glacier, crs, tf, nodata=255)
+    ndsi, tf, crs = merged_max(f["east", "ndsi_0.4"], f["west", "ndsi_0.4"])
+    #ratio, tf, crs = merged_max(f["east", "ratio_1"], f["west", "ratio_1"])
+    glacier = (ndsi == 1).astype("uint8")
+    write_tif(o / f"glacier_composite_{year}_{VERSION}.tiff", glacier, crs, tf, nodata=255)
 
 
 # ----------------------------------------------------------------------------
@@ -132,7 +134,7 @@ def threshold(src_path, dst_path, thr=THR):
 def step_threshold(year):
     folder = S1_BASE / str(year)
     for orbit in ("ascending", "descending"):
-        src = find_one(folder, f"coh_mosaic_{orbit}_{year}.tiff")
+        src = find_one(folder, f"coh_mosaic_{orbit}_{year}_masked_shadow.tiff")
         if src is None:
             print(f"Missing {orbit} coherence for {year}, skipping.")
             continue
@@ -154,7 +156,7 @@ def align(arr, meta, ref, src_nodata=None, dst_nodata=0):
 
 
 def step_align(year):
-    s2_file = S2_BASE / str(year) / f"glacier_composite_{year}.tiff"
+    s2_file = S2_BASE / str(year) / f"glacier_composite_{year}_{VERSION}.tiff"
     s1_files = [S1_BASE / str(year) / f"{o}_{year}_thresh_{THR}.tiff"
                 for o in ("ascending", "descending")]
     missing = [p.name for p in (s2_file, *s1_files) if not p.exists()]
@@ -164,13 +166,14 @@ def step_align(year):
 
     (asc, asc_meta), (desc, desc_meta) = (read_band(p) for p in s1_files)
     s2, s2_meta = read_band(s2_file)
-    ref = asc_meta                                   # reference grid
+    ref = asc_meta                                   
 
     s2_bin = align(s2, s2_meta, ref, dst_nodata=0) == 1
     s1_bin = (
         (align(asc, asc_meta, ref, 255, 255) == 1)
         | (align(desc, desc_meta, ref, 255, 255) == 1)
     )
+    
     for layer, arr in {"s2": s2_bin, "s1": s1_bin, "combined": s2_bin | s1_bin}.items():
         write_tif(layer_path(layer, "aligned", year, "tiff"),
                   arr, ref["crs"], ref["transform"], nodata=None)
@@ -238,16 +241,25 @@ def step_polygons(year):
 # ----------------------------------------------------------------------------
 # 6) Area per layer and region (east / west S2 extent)
 # ----------------------------------------------------------------------------
-def step_areas(year):
-    extents = {}
-    for region in ("east", "west"):
-        f = find_one(S2_BASE / str(year), f"S2_mosaic_{region}_*_ndsi_*.tiff")
-        if f is None:
-            print(f"No unique {region} NDSI mosaic for {year}, skipping region.")
-            continue
-        with rasterio.open(f) as src:
-            extents[region] = gpd.GeoDataFrame(geometry=[box(*src.bounds)], crs=src.crs)
+# Fixed study-area extents (EPSG:32632)
+SPATIAL_EXTENTS = {
+    "west": {"west": 610950, "east": 674650, "south": 5143820, "north": 5206380, "crs": "EPSG:32632"},  # Western South Tyrol glaciers
+    "east": {"west": 704100, "east": 747040, "south": 5195880, "north": 5219660, "crs": "EPSG:32632"},  # Eastern South Tyrol glaciers
+}
 
+
+def get_region_extents():
+    """Build the east/west clip boxes from the fixed coordinates."""
+    return {
+        region: gpd.GeoDataFrame(
+            geometry=[box(e["west"], e["south"], e["east"], e["north"])],
+            crs=e["crs"],
+        )
+        for region, e in SPATIAL_EXTENTS.items()
+    }
+
+
+def step_areas(year, extents):
     rows = []
     for layer in LAYERS:
         path = layer_path(layer, "outline", year, "shp")
@@ -271,6 +283,7 @@ def step_areas(year):
 # ----------------------------------------------------------------------------
 def main():
     inventory = gpd.read_file(INVENTORY) if "clean" in STEPS else None
+    extents = get_region_extents() if "areas" in STEPS else None
     rows = []
     for year in YEARS:
         print(f"\n===== {year} =====")
@@ -285,7 +298,7 @@ def main():
         if "polygons" in STEPS:
             step_polygons(year)
         if "areas" in STEPS:
-            rows += step_areas(year)
+            rows += step_areas(year, extents)
 
     if rows:
         df = pd.DataFrame(rows)
